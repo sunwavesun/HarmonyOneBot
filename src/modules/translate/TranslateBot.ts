@@ -1,138 +1,174 @@
-import {OnMessageContext, RefundCallback} from "../types";
-import pino, {Logger} from "pino";
-import {chatCompletion, getChatModel, getChatModelPrice, getTokenNumber} from "../open-ai/api/openAi";
-import config from "../../config";
+import { type OnMessageContext, type PayableBot, type RefundCallback, SessionState } from '../types'
+import pino, { type Logger } from 'pino'
+import { chatCompletion, getChatModel, getChatModelPrice, getTokenNumber } from '../open-ai/api/openAi'
+import config from '../../config'
 
 enum SupportedCommands {
   Translate = 'translate',
   TranslateStop = 'translatestop'
 }
 
-export class TranslateBot {
-
-  private logger: Logger
-  constructor() {
-
+export class TranslateBot implements PayableBot {
+  public readonly module = 'TranslateBot'
+  private readonly logger: Logger
+  constructor () {
     this.logger = pino({
       name: 'TranslateBot',
       transport: {
         target: 'pino-pretty',
-        options: {
-          colorize: true
-        }
+        options: { colorize: true }
       }
     })
   }
 
-  public getEstimatedPrice(ctx: OnMessageContext) {
+  public getEstimatedPrice (ctx: OnMessageContext): number {
     if (ctx.hasCommand(Object.values(SupportedCommands))) {
-      return 0;
+      return 0
     }
 
-    const hasCommand = this.isCtxHasCommand(ctx);
+    const hasCommand = this.isCtxHasCommand(ctx)
 
     if (!hasCommand && ctx.session.translate.enable) {
-      const message = ctx.message.text || '';
-      const promptTokens = getTokenNumber(message);
-      const modelPrice = getChatModel(config.openAi.chatGpt.model);
+      const message = ctx.message.text ?? ''
+      const promptTokens = getTokenNumber(message)
+      const modelPrice = getChatModel(config.openAi.chatGpt.model)
 
-      const languageCount = ctx.session.translate.languages.length;
+      const languageCount = ctx.session.translate.languages.length
 
       return getChatModelPrice(modelPrice, true, promptTokens, promptTokens * languageCount) *
-        config.openAi.chatGpt.priceAdjustment;
+        config.openAi.chatGpt.priceAdjustment
     }
 
-    return 0;
+    return 0
   }
 
-  public isCtxHasCommand(ctx: OnMessageContext) {
-    return ctx.entities().find((ent) => ent.type === 'bot_command');
+  public isCtxHasCommand (ctx: OnMessageContext): boolean {
+    const command = ctx.entities().find((ent) => ent.type === 'bot_command')
+    return !!command
   }
 
-  public isSupportedEvent(ctx: OnMessageContext): boolean {
-    const hasCommand = this.isCtxHasCommand(ctx);
-    return ctx.hasCommand(Object.values(SupportedCommands)) || (!hasCommand && ctx.session.translate.enable);
+  public isSupportedEvent (ctx: OnMessageContext): boolean {
+    const hasCommand = this.isCtxHasCommand(ctx)
+    return ctx.hasCommand(Object.values(SupportedCommands)) || (!hasCommand && ctx.session.translate.enable)
   }
 
-  public async onEvent(ctx: OnMessageContext, refundCallback: RefundCallback) {
+  public async onEvent (ctx: OnMessageContext, refundCallback: RefundCallback): Promise<void> {
+    ctx.session.analytics.module = this.module
     if (!this.isSupportedEvent(ctx)) {
-      await ctx.reply(`Unsupported command: ${ctx.message?.text}`, {
-        message_thread_id: ctx.message?.message_thread_id,
-      })
-      await refundCallback('Unsupported command')
-      return {next: true};
+      await ctx.reply(`Unsupported command: ${ctx.message?.text}`, { message_thread_id: ctx.message?.message_thread_id })
+      ctx.session.analytics.actualResponseTime = performance.now()
+      ctx.session.analytics.sessionState = SessionState.Error
+      refundCallback('Unsupported command')
+      return
     }
 
     if (ctx.hasCommand(SupportedCommands.Translate)) {
-      await this.runTranslate(ctx);
-      return {next: false};
+      await this.runTranslate(ctx)
+      return
     }
 
     if (ctx.hasCommand(SupportedCommands.TranslateStop)) {
-      await this.stopTranslate(ctx);
-      return {next: false};
+      await this.stopTranslate(ctx)
+      return
     }
 
-    const hasCommand = ctx.entities().find((ent) => ent.type === 'bot_command');
+    const hasCommand = ctx.entities().find((ent) => ent.type === 'bot_command')
 
     if (!hasCommand && ctx.session.translate.enable) {
-      await this.onTranslate(ctx);
-      return {next: false}
+      await this.onTranslate(ctx)
+      return
     }
 
-    await refundCallback('Unsupported command');
-    return {next: true};
+    refundCallback('Unsupported command')
   }
 
-  public parseCommand(message:string) {
-    const [command, ...lang] = message.split(' ');
-    return lang;
+  public parseCommand (message: string): string[] {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const [_, ...lang] = message.split(' ')
+    return lang
   }
 
-  public async runTranslate(ctx: OnMessageContext) {
-    ctx.chatAction = 'typing';
-    const langList = this.parseCommand(ctx.message?.text || '');
+  public async runTranslate (ctx: OnMessageContext): Promise<void> {
+    ctx.chatAction = 'typing'
+    const langList = this.parseCommand(ctx.message?.text ?? '')
 
     ctx.session.translate = {
       languages: langList,
       enable: true
     }
 
-    return ctx.reply(`Got it. I will translate the following messages into these languages:
-${langList.join(', '), {
-  message_thread_id: ctx.message?.message_thread_id,
-}}
+    await ctx.reply(`Got it. I will translate the following messages into these languages:
+${langList.join(', ')}
 
 To disable translation, use the command /translatestop.`)
+    ctx.session.analytics.actualResponseTime = performance.now()
+    ctx.session.analytics.sessionState = SessionState.Success
   }
 
-  public async stopTranslate(ctx: OnMessageContext) {
-    ctx.chatAction = 'typing';
-    ctx.session.translate.enable = false;
-    return ctx.reply('Translation is disabled', {
-      message_thread_id: ctx.message?.message_thread_id,
-    });
+  public async stopTranslate (ctx: OnMessageContext): Promise<void> {
+    ctx.chatAction = 'typing'
+    ctx.session.translate.enable = false
+    await ctx.reply('Translation is disabled', { message_thread_id: ctx.message?.message_thread_id })
+    ctx.session.analytics.actualResponseTime = performance.now()
+    ctx.session.analytics.sessionState = SessionState.Success
   }
 
-  public async onTranslate(ctx: OnMessageContext) {
-    const message = ctx.message.text;
+  public async onTranslate (ctx: OnMessageContext): Promise<void> {
+    const message = ctx.message.text
 
-    const progressMessage = await ctx.reply('...', {
-      message_thread_id: ctx.message?.message_thread_id,
-    });
-    ctx.chatAction = 'typing';
+    const progressMessage = await ctx.reply('...', { message_thread_id: ctx.message?.message_thread_id })
+    ctx.session.analytics.firstResponseTime = performance.now()
+    ctx.chatAction = 'typing'
 
     if (!message) {
-      return;
+      ctx.session.analytics.actualResponseTime = performance.now()
+      ctx.session.analytics.sessionState = SessionState.Success
+      return
     }
 
-    const prompt = `Translate the message below into: ${ctx.session.translate.languages.join(', ')}\n Message: ${message}`
-    const conversation = [{ role: "user", content: prompt }];
+    const conversation0 = [
+      {
+        role: 'system',
+        content: 'You will be provided with a sentence, and your task is detect original language.' +
+          'Use language codes for response.' +
+          "If you can't detect language use word 'unknown' for response." +
+          'When prompted, only respond with the translation, no explanation, or additional text ever.' +
+          'Also, if multiple translations are prompted, split each one with an empty line.'
+      },
+      { role: 'user', content: message }
+    ]
 
-    const response = await chatCompletion(conversation);
+    const completion01 = await chatCompletion(conversation0)
+    const originalLangCode = completion01.completion
 
-    return ctx.api.editMessageText(ctx.chat?.id!, progressMessage.message_id, response.completion, {
-      parse_mode: "Markdown",
-    });
+    // can't detect original language
+    if (completion01.completion === 'unknown') {
+      await ctx.api.deleteMessage(ctx.chat.id, progressMessage.message_id)
+      ctx.session.analytics.actualResponseTime = performance.now()
+      ctx.session.analytics.sessionState = SessionState.Success
+      return
+    }
+
+    // translation not required.
+    if (ctx.session.translate.languages.includes(originalLangCode)) {
+      await ctx.api.deleteMessage(ctx.chat.id, progressMessage.message_id)
+      ctx.session.analytics.actualResponseTime = performance.now()
+      ctx.session.analytics.sessionState = SessionState.Success
+      return
+    }
+
+    const targetLanguages = ctx.session.translate.languages.join(', ')
+
+    const conversation = [
+      { role: 'system', content: `You will be provided with a sentence in ${originalLangCode}, and your task is to translate it into ${targetLanguages}.` },
+      { role: 'user', content: message }
+    ]
+
+    const response = await chatCompletion(conversation)
+
+    await ctx.api.editMessageText(ctx.chat.id, progressMessage.message_id, response.completion, { parse_mode: 'Markdown' })
+
+    ctx.session.analytics.actualResponseTime = performance.now()
+    ctx.session.analytics.sessionState = SessionState.Success
   }
 }

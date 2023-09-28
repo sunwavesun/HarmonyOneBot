@@ -11,6 +11,7 @@ import {
 import { type AutoChatActionFlavor } from '@grammyjs/auto-chat-action'
 import { type ParseMode } from 'grammy/types'
 import { type InlineKeyboardMarkup } from 'grammy/out/types'
+import type { FileFlavor } from '@grammyjs/files'
 
 export interface ImageGenSessionData {
   numImages: number
@@ -45,6 +46,7 @@ export interface ChatConversation {
 export interface ChatGptSessionData {
   model: string
   isEnabled: boolean
+  isFreePromptChatGroups: boolean
   chatConversation: ChatConversation[]
   usage: number
   price: number
@@ -98,10 +100,10 @@ export interface BotSessionData {
   analytics: Analytics
 }
 
-export type BotContext = Context &
+export type BotContext = FileFlavor<Context &
 SessionFlavor<BotSessionData> &
 ConversationFlavor &
-AutoChatActionFlavor
+AutoChatActionFlavor>
 
 export type CustomContext<Q extends FilterQuery> = Filter<BotContext, Q>
 export type OnMessageContext = CustomContext<'message'>

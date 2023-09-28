@@ -1,16 +1,25 @@
 import * as dotenv from 'dotenv'
+import { execSync } from 'child_process'
 dotenv.config()
 
+let commitHash = ''
+try {
+  commitHash = execSync('git rev-parse HEAD').toString().trim()
+  console.log('### commitHash', commitHash)
+} catch (error) {
+  console.error('Error retrieving commit hash:', error)
+}
+
 export default {
+  botName: process.env.BOT_NAME ?? 'local',
+  commitHash,
   port: +(process.env.PORT ?? '3000'),
   appAdmins:
     (process.env.APP_ADMINS?.split(',').map((x) => parseInt(x))) ??
     [],
   telegramBotAuthToken: process.env.TELEGRAM_BOT_AUTH_TOKEN ?? '',
   openAiKey: process.env.OPENAI_API_KEY,
-  comfyHost: process.env.COMFY_HOST ?? '',
-  sdTrainHost: process.env.SD_TRAIN_HOST ?? '',
-  comfyWsHost: process.env.COMFY_WS_HOST ?? '',
+  sdBalancer: process.env.SD_BALANCER ?? '',
   comfyHost2: process.env.COMFY_HOST2 ?? '',
   comfyWsHost2: process.env.COMFY_WS_HOST2 ?? '',
   stableDiffusion: {
@@ -61,6 +70,7 @@ export default {
       priceAdjustment: process.env.PRICE_ADJUSTMENT
         ? parseInt(process.env.PRICE_ADJUSTMENT)
         : 2,
+      isFreePromptChatGroups: false,
       isEnabled: Boolean(parseInt(process.env.CHAT_GPT_ENABLED ?? '1')),
       isTypingEnabled: Boolean(
         parseInt(process.env.TYPING_STATUS_ENABLED ?? '1')
@@ -132,10 +142,11 @@ export default {
       'https://api.thegraph.com/subgraphs/name/nick8319/uniswap-v3-harmony'
   },
   walletConnect: { projectId: process.env.WALLET_CONNECT_PROJECT_ID ?? '' },
+  voiceTranslate: { isEnabled: Boolean(parseInt(process.env.BOT_VOICE_TRANSLATE_ENABLE ?? '0')) },
   db: { url: process.env.DATABASE_URL ?? '' },
   credits: {
-    maxChats: 10,
-    maxChatsWhitelist: (process.env.CREDITS_CHATS_WHITELIST ?? 'stephentse')
+    maxChats: 3,
+    maxChatsWhitelist: (process.env.CREDITS_CHATS_WHITELIST ?? '')
       .split(',')
       .map((item) => item.toString().toLowerCase()),
     creditsAmount: '100'
@@ -148,5 +159,7 @@ export default {
     username: process.env.ES_USERNAME ?? '',
     password: process.env.ES_PASSWORD ?? '',
     index: process.env.ES_INDEX
-  }
+  },
+  deepL: { apikey: process.env.DEEPL_API_KEY ?? '' },
+  gc: { credentials: process.env.GC_CREDENTIALS ?? '' }
 }

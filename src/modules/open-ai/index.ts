@@ -141,7 +141,7 @@ export class OpenAIBot implements PayableBot {
 
   public async onEvent (ctx: OnMessageContext | OnCallBackQueryData): Promise<void> {
     ctx.session.analytics.module = this.module
-    if (!(this.isSupportedEvent(ctx)) && ctx.chat?.type !== 'private') {
+    if (!(this.isSupportedEvent(ctx)) && (ctx.chat?.type !== 'private') && !ctx.session.openAi.chatGpt.isFreePromptChatGroups) {
       ctx.session.analytics.sessionState = SessionState.Error
       this.logger.warn(`### unsupported command ${ctx.message?.text}`)
       return
@@ -247,7 +247,7 @@ export class OpenAIBot implements PayableBot {
       return
     }
 
-    if (ctx.chat?.type === 'private') {
+    if (ctx.chat?.type === 'private' || ctx.session.openAi.chatGpt.isFreePromptChatGroups) {
       await this.onPrivateChat(ctx)
       return
     }
@@ -264,11 +264,8 @@ export class OpenAIBot implements PayableBot {
   private async hasBalance (ctx: OnMessageContext | OnCallBackQueryData): Promise<boolean> {
     const accountId = this.payments.getAccountId(ctx as OnMessageContext)
     const addressBalance = await this.payments.getUserBalance(accountId)
-    const creditsBalance = await chatService.getBalance(accountId)
-    const fiatCreditsBalance = await chatService.getFiatBalance(accountId)
-    const balance = addressBalance
-      .plus(creditsBalance)
-      .plus(fiatCreditsBalance)
+    const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+    const balance = addressBalance.plus(totalCreditsAmount)
     const balanceOne = this.payments.toONE(balance, false)
     return (
       (+balanceOne > +config.openAi.chatGpt.minimumBalance) ||
@@ -502,8 +499,9 @@ export class OpenAIBot implements PayableBot {
       )
       if (webContent.urlText !== '') {
         const oneFee = await this.payments.getPriceInONE(webContent.fees)
-        const statusMsg = `Processed ${(webContent.networkTraffic / 1048576).toFixed(2
-          )} MB in ${(webContent.elapsedTime / 1000).toFixed(2)} sec (${this.payments.toONE(oneFee, false).toFixed(2)} ONE)`
+        // console.log(+oneFee.toFixed() + 3500000000000000);
+        const statusMsg = `${url} downloaded: ${(webContent.networkTraffic / 1048576).toFixed(2
+          )}m size ${(webContent.elapsedTime / 1000).toFixed(2)}s time (${this.payments.toONE(oneFee, false).toFixed(2)} ONE fee)`
         await ctx.api.editMessageText(ctx.chat?.id ?? '', webCrawlerStatusMsgId, statusMsg, { parse_mode: 'Markdown' }).catch(async (e) => {
           await this.onError(ctx, e)
         })
@@ -538,6 +536,7 @@ export class OpenAIBot implements PayableBot {
             true
           )
           price += webCrawlerResult.price
+
           if (prompt !== '') {
             newPrompt = `${
               command === 'sum' ? 'Summarize' : ''
@@ -656,6 +655,20 @@ export class OpenAIBot implements PayableBot {
     }
   }
 
+  private async freePromptChatGroup (ctx: OnMessageContext | OnCallBackQueryData, prompt: string): Promise<boolean> {
+    if (prompt === 'on' || prompt === 'On') {
+      ctx.session.openAi.chatGpt.isFreePromptChatGroups = true
+      await ctx.reply('Command free Open AI is enabled').catch(async (e) => { await this.onError(ctx, e) })
+      return true
+    }
+    if (prompt === 'off' || prompt === 'Off') {
+      ctx.session.openAi.chatGpt.isFreePromptChatGroups = false
+      await ctx.reply('Command free Open AI is disabled').catch(async (e) => { await this.onError(ctx, e) })
+      return true
+    }
+    return false
+  }
+
   async onChat (ctx: OnMessageContext | OnCallBackQueryData): Promise<void> {
     try {
       if (this.botSuspended) {
@@ -665,6 +678,9 @@ export class OpenAIBot implements PayableBot {
         return
       }
       const prompt = ctx.match ? ctx.match : ctx.message?.text
+      if (await this.freePromptChatGroup(ctx, prompt as string)) {
+        return
+      }
       ctx.session.openAi.chatGpt.requestQueue.push(
         await preparePrompt(ctx, prompt as string)
       )
@@ -762,11 +778,8 @@ export class OpenAIBot implements PayableBot {
     const accountId = this.payments.getAccountId(ctx as OnMessageContext)
     const account = this.payments.getUserAccount(accountId)
     const addressBalance = await this.payments.getUserBalance(accountId)
-    const creditsBalance = await chatService.getBalance(accountId)
-    const fiatCreditsBalance = await chatService.getFiatBalance(accountId)
-    const balance = addressBalance
-      .plus(creditsBalance)
-      .plus(fiatCreditsBalance)
+    const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+    const balance = addressBalance.plus(totalCreditsAmount)
     const balanceOne = this.payments.toONE(balance, false).toFixed(2)
     const balanceMessage = appText.notEnoughBalance
       .replaceAll('$CREDITS', balanceOne)

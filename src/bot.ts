@@ -34,7 +34,7 @@ import { BotSchedule } from './modules/schedule'
 import { LlmsBot } from './modules/llms'
 import { DocumentHandler } from './modules/document-handler'
 import config from './config'
-import { commandsHelpText, FEEDBACK, LOVE, MODELS, SUPPORT, TERMS } from './constants'
+import { commandsHelpText, FEEDBACK, LOVE, MODELS, SUPPORT, TERMS, LANG } from './constants'
 import prometheusRegister, { PrometheusMetrics } from './metrics/prometheus'
 
 import { chatService, statsService } from './database/services'
@@ -49,6 +49,10 @@ import * as Sentry from '@sentry/node'
 import * as Events from 'events'
 import { ProfilingIntegration } from '@sentry/profiling-node'
 import { ES } from './es'
+import { hydrateFiles } from '@grammyjs/files'
+import { VoiceTranslateBot } from './modules/voice-translate'
+import { TextToSpeechBot } from './modules/text-to-speech'
+import { VoiceToTextBot } from './modules/voice-to-text'
 
 Events.EventEmitter.defaultMaxListeners = 30
 
@@ -61,6 +65,7 @@ const logger = pino({
 })
 
 export const bot = new Bot<BotContext>(config.telegramBotAuthToken)
+bot.api.config.use(hydrateFiles(bot.token))
 bot.api.config.use(autoRetry())
 
 bot.use(
@@ -85,12 +90,15 @@ bot.use(
 
 Sentry.init({
   dsn: config.sentry.dsn,
+  release: config.commitHash,
   integrations: [
     new ProfilingIntegration()
   ],
   tracesSampleRate: 1.0, // Performance Monitoring. Should use 0.1 in production
   profilesSampleRate: 1.0 // Set sampling rate for profiling - this is relative to tracesSampleRate
 })
+
+Sentry.setTags({ botName: config.botName })
 
 ES.init()
 
@@ -156,6 +164,7 @@ function createInitialSessionData (): BotSessionData {
       chatGpt: {
         model: config.openAi.chatGpt.model,
         isEnabled: config.openAi.chatGpt.isEnabled,
+        isFreePromptChatGroups: config.openAi.chatGpt.isFreePromptChatGroups,
         chatConversation: [],
         price: 0,
         usage: 0,
@@ -206,11 +215,14 @@ const walletConnect = new WalletConnect()
 const payments = new BotPayments()
 const schedule = new BotSchedule(bot)
 const openAiBot = new OpenAIBot(payments)
-const oneCountryBot = new OneCountryBot()
+const oneCountryBot = new OneCountryBot(payments)
 const translateBot = new TranslateBot()
 const llmsBot = new LlmsBot(payments)
 const documentBot = new DocumentHandler()
 const telegramPayments = new TelegramPayments(payments)
+const voiceTranslateBot = new VoiceTranslateBot(payments)
+const textToSpeechBot = new TextToSpeechBot(payments)
+const voiceToTextBot = new VoiceToTextBot(payments)
 
 bot.on('message:new_chat_members:me', async (ctx) => {
   try {
@@ -320,9 +332,12 @@ const writeCommandLog = async (
 const PayableBots: Record<string, PayableBotConfig> = {
   qrCodeBot: { bot: qrCodeBot },
   sdImagesBot: { bot: sdImagesBot },
+  voiceTranslate: { bot: voiceTranslateBot },
   voiceMemo: { bot: voiceMemo },
   documentBot: { bot: documentBot },
   translateBot: { bot: translateBot },
+  textToSpeech: { bot: textToSpeechBot },
+  voiceToText: { bot: voiceToTextBot },
   openAiBot: {
     enabled: (ctx: OnMessageContext) => ctx.session.openAi.imageGen.isEnabled,
     bot: openAiBot
@@ -341,15 +356,10 @@ const UtilityBots: Record<string, UtilityBot> = {
 }
 
 const executeOrRefund = (ctx: OnMessageContext, price: number, bot: PayableBot): void => {
-  const refund = (reason?: string): void => {
-    payments.refundPayment(reason, ctx, price).catch((ex: any) => {
-      Sentry.captureException(ex)
-      logger.error('Refund error', reason, ex)
-    })
-  }
+  const refund = (reason?: string): void => {}
   bot.onEvent(ctx, refund).catch((ex: any) => {
     Sentry.captureException(ex)
-    refund(ex?.message ?? 'Unknown error')
+    logger.error(ex?.message ?? 'Unknown error')
   })
 }
 
@@ -377,6 +387,7 @@ const onMessage = async (ctx: OnMessageContext): Promise<void> => {
         const price = bot.getEstimatedPrice(ctx)
         const isPaid = await payments.pay(ctx, price)
         if (isPaid) {
+          logger.info(`command controller: ${bot.constructor.name}`)
           executeOrRefund(ctx, price, bot)
         }
         return
@@ -385,11 +396,12 @@ const onMessage = async (ctx: OnMessageContext): Promise<void> => {
         if (!bot.isSupportedEvent(ctx)) {
           continue
         }
+        logger.info(`command controller: ${bot.constructor.name}`)
         await bot.onEvent(ctx)
         return
       }
-      // Any message interacts with ChatGPT (only for private chats)
-      if (ctx.update.message.chat && ctx.chat.type === 'private') {
+      // Any message interacts with ChatGPT (only for private chats or /ask on enabled on group chats)
+      if (ctx.update.message.chat && (ctx.chat.type === 'private' || ctx.session.openAi.chatGpt.isFreePromptChatGroups)) {
         await openAiBot.onEvent(ctx)
         return
       }
@@ -442,9 +454,8 @@ bot.command(['start', 'help', 'menu'], async (ctx) => {
   await writeCommandLog(ctx as OnMessageContext)
 
   const addressBalance = await payments.getAddressBalance(account.address)
-  const credits = await chatService.getBalance(accountId)
-  const fiatCredits = await chatService.getFiatBalance(accountId)
-  const balance = addressBalance.plus(credits).plus(fiatCredits)
+  const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+  const balance = addressBalance.plus(totalCreditsAmount)
   const balanceOne = payments.toONE(balance, false).toFixed(2)
   const startText = commandsHelpText.start
     .replaceAll('$CREDITS', balanceOne + '')
@@ -493,6 +504,14 @@ bot.command('support', async (ctx) => {
 bot.command('models', async (ctx) => {
   writeCommandLog(ctx as OnMessageContext).catch(logErrorHandler)
   return await ctx.reply(MODELS.text, {
+    parse_mode: 'Markdown',
+    disable_web_page_preview: true
+  })
+})
+
+bot.command('lang', async (ctx) => {
+  writeCommandLog(ctx as OnMessageContext).catch(logErrorHandler)
+  return await ctx.reply(LANG.text, {
     parse_mode: 'Markdown',
     disable_web_page_preview: true
   })
@@ -607,6 +626,7 @@ async function bootstrap (): Promise<void> {
   })
 
   await AppDataSource.initialize()
+  payments.bootstrap()
 
   const prometheusMetrics = new PrometheusMetrics()
   await prometheusMetrics.bootstrap()
@@ -653,6 +673,6 @@ async function bootstrap (): Promise<void> {
 }
 
 bootstrap().catch((error) => {
-  console.error(`bot bootstrap error ${error}`)
+  logger.error(`bot bootstrap error ${error}`)
   process.exit(1)
 })

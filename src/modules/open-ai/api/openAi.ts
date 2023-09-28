@@ -17,6 +17,7 @@ import {
   type DalleGPTModel,
   DalleGPTModels
 } from '../types'
+import type fs from 'fs'
 
 const openai = new OpenAI({ apiKey: config.openAiKey })
 
@@ -135,7 +136,6 @@ export const streamChatCompletion = async (
     // if (wordCount > 20) {
     //   throw getGrammy429Error()
     // }
-    console.log(wordCount, wordCountMinimum)
     if (wordCount > wordCountMinimum) { // if (chunck === '.' && wordCount > wordCountMinimum) {
       if (wordCountMinimum < 64) {
         wordCountMinimum *= 2
@@ -245,4 +245,13 @@ export function getGrammy429Error (): GrammyError {
     'editMessageText',
     { parameters: { retry_after: 33 } }
   )
+}
+
+export async function speechToText (readStream: fs.ReadStream): Promise<string> {
+  const result = await openai.audio.transcriptions.create({
+    file: readStream,
+    model: 'whisper-1'
+  })
+
+  return result.text
 }

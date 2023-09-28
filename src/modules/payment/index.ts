@@ -5,16 +5,12 @@ import axios from 'axios'
 import bn, { BigNumber } from 'bignumber.js'
 import config from '../../config'
 import { chatService, statsService } from '../../database/services'
-import { type OnMessageContext, Callbacks, type OnCallBackQueryData } from '../types'
+import { type OnCallBackQueryData, type OnMessageContext } from '../types'
 import { LRUCache } from 'lru-cache'
-import {
-  oneTokenFeeCounter,
-  freeCreditsFeeCounter
-} from '../../metrics/prometheus'
+import { freeCreditsFeeCounter } from '../../metrics/prometheus'
 import { type BotPaymentLog } from '../../database/stats.service'
 import { sendMessage } from '../open-ai/helpers'
 import * as Sentry from '@sentry/node'
-import { InlineKeyboard } from 'grammy'
 
 interface CoinGeckoResponse {
   harmony: {
@@ -23,14 +19,12 @@ interface CoinGeckoResponse {
 }
 
 export class BotPayments {
-  private readonly hotWallet: Account
   private readonly holderAddress = config.payment.holderAddress
   private readonly logger: Logger
   private readonly web3: Web3
   private ONERate: number = 0
   private ONERateUpdateTimestamp = 0
   private readonly rpcURL: string = 'https://api.harmony.one'
-  private lastPaymentTimestamp = 0
   private readonly noncePending = new LRUCache<string, number>({
     max: 1000,
     ttl: 30 * 1000
@@ -54,14 +48,86 @@ export class BotPayments {
     } else {
       this.logger.info(`Payments holder address: ${this.holderAddress}`)
     }
+  }
 
-    this.hotWallet = this.getUserAccount('hot_wallet') as Account
-    this.logger.info(`Hot wallet address: ${this.hotWallet.address}`)
-
-    this.getOneRate().catch(ex => {
-      Sentry.captureException(ex)
-      this.logger.error(`get one rate error ${ex}`)
+  public bootstrap (): void {
+    this.runHotWalletsTask().catch(e => {
+      Sentry.captureException(e)
     })
+    this.getOneRate().catch(e => {
+      Sentry.captureException(e)
+    })
+  }
+
+  private async transferUserFundsToHolder (
+    accountId: number,
+    userAccount: Account,
+    amount: BigNumber
+  ): Promise<void> {
+    // const invoiceData: InvoiceParams = {
+    //   tgUserId: accountId,
+    //   accountId,
+    //   amount: this.convertBigNumber(amount),
+    //   itemId: 'deposit_one',
+    //   currency: 'ONE'
+    // }
+    // const invoice = await invoiceService.create(invoiceData)
+    await this.transferFunds(userAccount, this.holderAddress, amount)
+    await chatService.depositOneCredits(accountId, amount.toFixed())
+    // await invoiceService.setSuccessStatus({ uuid: invoice.uuid, providerPaymentChargeId: '', telegramPaymentChargeId: '' })
+  }
+
+  private async runHotWalletsTask (): Promise<void> {
+    while (true) {
+      try {
+        await this.checkHotWallets()
+      } catch (e) {
+        Sentry.captureException(e)
+      }
+      await new Promise(resolve => setTimeout(resolve, 60 * 1000))
+    }
+  }
+
+  private async checkHotWallets (): Promise<void> {
+    let accounts: Array<{ accountId: string }> = []
+    try {
+      accounts = await statsService.getLastInteractingAccounts(24)
+    } catch (e) {
+      Sentry.captureException(e)
+      this.logger.error(`Cannot get last interacted accounts: ${(e as Error).message}`)
+    }
+
+    const txFee = await this.getTransactionFee()
+
+    for (const acc of accounts) {
+      const accountId = +acc.accountId
+      const userAccount = this.getUserAccount(accountId)
+      if (userAccount) {
+        let availableBalance = new BigNumber(0)
+        try {
+          availableBalance = await this.getUserBalance(accountId)
+        } catch (e) {
+          Sentry.captureException(e)
+          this.logger.error(`Cannot get user balance ${accountId} ${userAccount.address}`)
+        }
+
+        if (availableBalance.minus(txFee).gt(0)) {
+          try {
+            this.logger.info(`User ${accountId} ${userAccount.address} transfer funds ${availableBalance.toFixed()} ONE to multisig wallet: ${this.holderAddress}...`)
+            await this.transferUserFundsToHolder(accountId, userAccount, availableBalance)
+            const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+            this.logger.info(`User ${accountId} ${userAccount.address} hot wallet funds "${availableBalance.toFixed()}" ONE transferred to holder address ${this.holderAddress}. User credits balance: ${totalCreditsAmount.toFixed()}.`)
+          } catch (e) {
+            Sentry.captureException(e)
+            this.logger.error(
+              `Cannot transfer user "${userAccount.address}" funds to holder "${this.holderAddress}": ${(e as Error).message}`
+            )
+          }
+        }
+      } else {
+        this.logger.error(`Cannot get account with id "${accountId}"`)
+      }
+    }
   }
 
   private async getOneRate (): Promise<number> {
@@ -86,7 +152,8 @@ export class BotPayments {
     }
     this.ONERate = oneRate
     this.ONERateUpdateTimestamp = Date.now()
-    return this.ONERate
+    this.logger.info(`Updated ONE token rate: ${oneRate}`)
+    return oneRate
   }
 
   public getUserAccount (
@@ -121,15 +188,26 @@ export class BotPayments {
   public async getUserBalance (accountId: number): Promise<bn> {
     const account = this.getUserAccount(accountId)
     if (account) {
-      const addressBalance = await this.getAddressBalance(account.address)
-      return addressBalance
+      return await this.getAddressBalance(account.address)
     }
     return bn(0)
   }
 
   private async getTransactionFee (): Promise<bn> {
-    const gasPrice = await this.web3.eth.getGasPrice()
-    return bn(gasPrice.toString()).multipliedBy(35000)
+    const estimatedFee = await this.estimateTransferFee()
+    return bn(estimatedFee)
+  }
+
+  private async estimateTransferFee (): Promise<number> {
+    const web3 = new Web3(this.rpcURL)
+    const gasPrice = await web3.eth.getGasPrice()
+    const txBody = {
+      from: this.holderAddress,
+      to: this.holderAddress,
+      value: web3.utils.toHex('0')
+    }
+    const estimatedGas = await web3.eth.estimateGas(txBody)
+    return estimatedGas * +gasPrice
   }
 
   private async transferFunds (
@@ -158,13 +236,16 @@ export class BotPayments {
         value: web3.utils.toHex(amount.toFixed()),
         nonce
       }
-      const gasLimit = await web3.eth.estimateGas(txBody)
-      const tx = await web3.eth.sendTransaction({
+      const estimatedGas = await web3.eth.estimateGas(txBody)
+      const gasValue = estimatedGas * +gasPrice
+      const txValue = amount.minus(BigNumber(gasValue)).toFixed()
+
+      return await web3.eth.sendTransaction({
         ...txBody,
         gasPrice,
-        gas: web3.utils.toHex(gasLimit)
+        gas: web3.utils.toHex(estimatedGas),
+        value: web3.utils.toHex(txValue)
       })
-      return tx
     } catch (e) {
       Sentry.captureException(e)
       const message = (e as Error).message || ''
@@ -215,65 +296,8 @@ export class BotPayments {
     }
 
     if (this.ONERate === 0) {
-      this.logger.warn('ONE token rate is 0, skip payment')
+      this.logger.error('ONE token rate is 0, skip payment')
       return true
-    }
-
-    return false
-  }
-
-  public async refundPayment (
-    reason = '',
-    ctx: OnMessageContext,
-    amountUSD: number
-  ): Promise<boolean> {
-    const { id: userId, username = '' } = ctx.update.message.from
-    if (ctx.session.refunded) {
-      Sentry.captureMessage('already refunded')
-      this.logger.error(`[${userId} @${username}] already refunded`)
-      return true
-    }
-
-    this.logger.error(
-      `[${userId} @${username}] refund payment: $${amountUSD}, reason: "${reason}"`
-    )
-
-    if (this.skipPayment(ctx, amountUSD)) {
-      this.logger.info(`[${userId} @${username}] skip refund`)
-      return true
-    }
-
-    const accountId = this.getAccountId(ctx)
-    const userAccount = this.getUserAccount(accountId)
-    if (userAccount) {
-      const amountONE = await this.getPriceInONE(amountUSD)
-      const fee = await this.getTransactionFee()
-      try {
-        const tx = await this.transferFunds(
-          this.hotWallet,
-          userAccount.address,
-          amountONE.minus(fee)
-        )
-        if (tx) {
-          this.logger.info(
-            `[${userId} @${username}] refund successful, from: ${
-              tx.from
-            }, to: ${tx.to}, amount ONE: ${amountONE.toFixed()}, txHash: ${
-              tx.transactionHash
-            }`
-          )
-        }
-        ctx.session.refunded = true
-        return true
-      } catch (e) {
-        Sentry.captureException(e)
-        this.logger.error(
-          `[${userId} @${username}] amountONE: ${amountONE.toFixed()} refund error : ${
-            (e as Error).message
-          }`
-        )
-        return false
-      }
     }
 
     return false
@@ -285,9 +309,7 @@ export class BotPayments {
 
   private async writePaymentLog (
     ctx: OnMessageContext,
-    amountCredits: BigNumber,
-    amountOne: BigNumber,
-    amountFiatCredits: BigNumber
+    amountCredits: BigNumber
   ): Promise<void> {
     const { from, text = '', audio, voice = '', chat } = ctx.update.message
 
@@ -311,8 +333,9 @@ export class BotPayments {
         message: text || '',
         isSupportedCommand: true,
         amountCredits: this.convertBigNumber(amountCredits),
-        amountOne: this.convertBigNumber(amountOne),
-        amountFiatCredits: this.convertBigNumber(amountFiatCredits)
+        // TODO: remove fields from DB
+        amountOne: 0,
+        amountFiatCredits: 0
       }
       await statsService.writeLog(log)
     } catch (e) {
@@ -321,6 +344,10 @@ export class BotPayments {
         `Cannot write payments log: ${JSON.stringify((e as Error).message)}`
       )
     }
+  }
+
+  public async rent (ctx: OnMessageContext, domainName: string): Promise<boolean> {
+    return true
   }
 
   public async pay (ctx: OnMessageContext, amountUSD: number): Promise<boolean> {
@@ -337,96 +364,51 @@ export class BotPayments {
       return false
     }
 
-    if (Date.now() - this.lastPaymentTimestamp > 60 * 1000) {
-      await this.withdrawHotWalletFunds()
-    }
-
     this.logger.info(
-      `Pay event @${from.username}(${from.id}) in chat ${chat.id} (${chat.type}), accountId: ${accountId}, account address: ${userAccount.address}`
+      `Payment requested @${from.username}(${from.id}) in chat ${chat.id} (${chat.type}), accountId: ${accountId}, account address: ${userAccount.address}`
     )
-
-    let amountToPay = await this.getPriceInONE(amountUSD)
-    const fee = await this.getTransactionFee()
-    amountToPay = amountToPay.plus(fee)
-    const balance = await this.getUserBalance(accountId)
-    const credits = await chatService.getBalance(accountId)
-    const fiatCredits = await chatService.getFiatBalance(accountId)
-    const balanceTotal = balance.plus(credits).plus(fiatCredits)
-    const balanceDelta = balanceTotal.minus(amountToPay)
-
-    const creditsPayAmount = bn.min(amountToPay, credits)
-    const fiatCreditsPayAmount = bn.min(amountToPay.minus(creditsPayAmount), fiatCredits)
-    const oneTokensPayAmount = bn.min(amountToPay.minus(creditsPayAmount).minus(fiatCreditsPayAmount), balance)
 
     if (this.skipPayment(ctx, amountUSD)) {
-      await this.writePaymentLog(ctx, BigNumber(0), BigNumber(0), BigNumber(0))
+      await this.writePaymentLog(ctx, BigNumber(0))
       return true
     }
 
+    const userBalance = await this.getUserBalance(accountId)
+    if (userBalance.gt(0)) {
+      const fee = await this.getTransactionFee()
+      if (userBalance.minus(fee).gt(0)) {
+        this.logger.info(`Found user with ONE balance. Start transferring ${userBalance.toString()} ONE to holder address ${this.holderAddress}...`)
+        await this.transferUserFundsToHolder(accountId, userAccount, userBalance)
+        this.logger.info(`Funds transferred from ${accountId} ${userAccount.address} to holder address ${this.holderAddress}, amount: ${userBalance.toString()}`)
+      }
+    }
+
+    const totalPayAmount = await this.getPriceInONE(amountUSD)
+    const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+    const totalBalanceDelta = totalCreditsAmount.minus(totalPayAmount)
+
     this.logger.info(
-      `[@${
+      `[${from.id} @${
         from.username
-      }] credits: ${credits.toFixed()}, ONE balance: ${balance.toFixed()}, to withdraw: ${amountToPay.toFixed()}, balance after: ${balanceDelta.toFixed()}`
+      }] credits total: ${totalCreditsAmount.toFixed()}, to withdraw: ${totalPayAmount.toFixed()}, total balance after: ${totalBalanceDelta.toFixed()}`
     )
-    if (balanceDelta.gte(0)) {
-      if (amountToPay.gt(0) && credits.gt(0)) {
-        await chatService.withdrawAmount(accountId, creditsPayAmount.toFixed())
-        amountToPay = amountToPay.minus(creditsPayAmount)
-        freeCreditsFeeCounter.inc(this.convertBigNumber(creditsPayAmount))
-        this.logger.info(
-          `[@${
-            from.username
-          }] paid from credits: ${creditsPayAmount.toFixed()}, left to pay: ${amountToPay.toFixed()}`
-        )
-      }
 
-      if (amountToPay.gt(0) && fiatCredits.gte(0)) {
-        await chatService.withdrawFiatAmount(accountId, fiatCreditsPayAmount.toFixed())
-        amountToPay = amountToPay.minus(fiatCreditsPayAmount)
-        this.logger.info(`[@${from.username}] paid from fiat credits: ${fiatCreditsPayAmount.toFixed()}, left to pay: ${amountToPay.toFixed()}`)
-      }
+    if (totalBalanceDelta.gte(0)) {
+      const balanceAfter = await chatService.withdrawCredits(accountId, totalPayAmount)
+      this.logger.info(`[${from.id} @${
+        from.username
+      }] successfully paid from credits, credits balance after: ${balanceAfter.totalCreditsAmount}`)
 
-      if (amountToPay.gt(0)) {
-        try {
-          const tx = await this.transferFunds(
-            userAccount,
-            this.hotWallet.address,
-            amountToPay
-          )
-          this.lastPaymentTimestamp = Date.now()
-          if (tx) {
-            oneTokenFeeCounter.inc(this.convertBigNumber(amountToPay))
-            this.logger.info(
-              `[${from.id} @${from.username}] withdraw successful, txHash: ${
-                tx.transactionHash
-              }, from: ${tx.from}, to: ${
-                tx.to
-              }, amount ONE: ${amountToPay.toString()}`
-            )
-          }
-        } catch (e) {
-          Sentry.captureException(e)
-          this.logger.error(
-            `[${from.id}] withdraw error: "${JSON.stringify(
-              (e as Error).message
-            )}"`
-          )
-          await sendMessage(ctx, 'Payment error, try again later', {
-            parseMode: 'Markdown',
-            replyId: message_id
-          })
-        }
-      }
-      await this.writePaymentLog(ctx, creditsPayAmount, oneTokensPayAmount, fiatCreditsPayAmount)
+      freeCreditsFeeCounter.inc(this.convertBigNumber(totalPayAmount))
+      await this.writePaymentLog(ctx, totalPayAmount)
       return true
     } else {
-      const addressBalance = await this.getAddressBalance(userAccount.address)
-      const creditsBalance = await chatService.getBalance(accountId)
-      const fiatCreditsBalance = await chatService.getFiatBalance(accountId)
-      const balance = addressBalance.plus(creditsBalance).plus(fiatCreditsBalance)
-      const balanceOne = this.toONE(balance, false).toFixed(2)
+      const oneBalance = await this.getAddressBalance(userAccount.address)
+      const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
+      const totalBalance = oneBalance.plus(totalCreditsAmount)
+      const creditsFormatted = this.toONE(totalBalance, false).toFixed(2)
       await sendMessage(ctx,
-        `Your credits: ${balanceOne} ONE tokens. To recharge, send to \`${userAccount.address}\`.`,
+        `Your credits: ${creditsFormatted} ONE tokens. To recharge, send to \`${userAccount.address}\`.`,
         {
           parseMode: 'Markdown',
           replyId: message_id
@@ -511,25 +493,18 @@ export class BotPayments {
     }
     if (text === '/credits') {
       try {
-        const freeCredits = await chatService.getBalance(accountId)
-        const fiatCredits = await chatService.getFiatBalance(accountId)
+        const { totalCreditsAmount } = await chatService.getUserCredits(accountId)
         const addressBalance = await this.getAddressBalance(account.address)
-        const balance = addressBalance.plus(freeCredits).plus(fiatCredits)
-        const balanceOne = this.toONE(balance, false)
-
-        const buyCreditsButton = new InlineKeyboard().text(
-          'Buy Now',
-          Callbacks.CreditsFiatBuy
-        )
-
+        const balanceTotal = totalCreditsAmount.plus(addressBalance)
+        const balanceFormatted = this.toONE(balanceTotal, false)
         await sendMessage(
           ctx,
-          `Your 1Bot Credits: ${balanceOne.toFixed(2)}` +
-          `\n\nClick “Buy Now" below to recharge. Or, send to \`${account.address}\` with tokens from harmony.one/buy.`,
+          `Your 1Bot credits in ONE tokens: ${balanceFormatted.toFixed(2)}
+
+To recharge, send to: \`${account.address}\`. Buy tokens on harmony.one/buy.`,
           {
             parseMode: 'Markdown',
-            disable_web_page_preview: true,
-            reply_markup: buyCreditsButton
+            disable_web_page_preview: true
           }
         )
       } catch (e) {
@@ -541,7 +516,7 @@ export class BotPayments {
       const amount = await this.migrateFunds(accountId)
       const balance = await this.getAddressBalance(account.address)
       const balanceOne = this.toONE(balance, false)
-      let replyText = ''
+      let replyText: string
       if (amount.gt(0)) {
         replyText = `Transferred ${this.toONE(amount, false).toFixed(
           2
@@ -554,39 +529,6 @@ export class BotPayments {
         )} ONE`
       }
       await sendMessage(ctx, replyText, { parseMode: 'Markdown' })
-    }
-  }
-
-  private readonly sleep = async (timeout: number): Promise<unknown> =>
-    await new Promise((resolve) => setTimeout(resolve, timeout))
-
-  private async withdrawHotWalletFunds (): Promise<void> {
-    try {
-      const hotWalletBalance = await this.getAddressBalance(
-        this.hotWallet.address
-      )
-      const fee = await this.getTransactionFee()
-      if (hotWalletBalance.gt(fee)) {
-        await this.transferFunds(
-          this.hotWallet,
-          this.holderAddress,
-          hotWalletBalance.minus(fee)
-        )
-        this.logger.info(
-          `Hot wallet funds transferred from hot wallet ${
-            this.hotWallet.address
-          } to holder address: ${
-            this.holderAddress
-          }, amount: ${hotWalletBalance.toFixed()}`
-        )
-      } else {
-        // this.logger.info(`Hot wallet ${this.hotWallet.address} balance is zero, skip withdrawal`)
-      }
-    } catch (e) {
-      Sentry.captureException(e)
-      this.logger.error(
-        `Cannot withdraw hot wallet funds: ${(e as Error).message}`
-      )
     }
   }
 }
